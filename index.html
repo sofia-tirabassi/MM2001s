@@ -3818,7 +3818,31 @@ var LIVE = (() => {
     showing() { return false; }, counts() { return null; }, decorateDots() {} };
   if (!role) { addJoinBox(); return api; }
 
+  /* ---- ICE servers (NAT/firewall traversal), as in MM5023 ----
+     1. your own TURN credentials, from turn.json next to this page (see LIVE.md), e.g.
+          { "iceServers": [ { "urls": [...], "username": "...", "credential": "..." } ] }
+        or{ "metered": "https://YOURAPP.metered.live/api/v1/turn/credentials?apiKey=KEY" }
+     2. otherwise the public "static auth" secret of the Open Relay Project (no guarantee).  */
+  let relayInfo = 'relä: kontrollerar…';
+  async function ownTurn() {
+    try {
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 5000);
+      const r = await fetch('turn.json', { cache: 'no-store', signal: ctl.signal }); clearTimeout(t);
+      if (!r.ok) return null;
+      const cfg = await r.json();
+      if (Array.isArray(cfg.iceServers) && cfg.iceServers.length) return { list: cfg.iceServers, src: 'egen TURN (turn.json)' };
+      if (typeof cfg.metered === 'string' && /^https:\/\//.test(cfg.metered) && !/YOURAPP|API_?KEY/i.test(cfg.metered)) {
+        const ctl2 = new AbortController(); const t2 = setTimeout(() => ctl2.abort(), 6000);
+        const r2 = await fetch(cfg.metered, { cache: 'no-store', signal: ctl2.signal }); clearTimeout(t2);
+        const list = await r2.json();
+        if (Array.isArray(list) && list.length) return { list, src: 'egen TURN (Metered)' };
+      }
+    } catch (e) { /* no file, offline, or bad credentials: fall back */ }
+    return null;
+  }
   async function iceServers() {
+    const own = await ownTurn();
+    if (own) { relayInfo = 'relä: ' + own.src; return [{ urls: 'stun:stun.l.google.com:19302' }].concat(own.list); }
     const list = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:' + TURN_HOST + ':80' }];
     try {
       const user = Math.floor(Date.now() / 1000 + 24 * 3600) + ':matte1';
@@ -3826,10 +3850,12 @@ var LIVE = (() => {
       const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(user));
       const cred = btoa(String.fromCharCode(...new Uint8Array(sig)));
       list.push({ urls: ['turn:' + TURN_HOST + ':80', 'turn:' + TURN_HOST + ':80?transport=tcp', 'turn:' + TURN_HOST + ':443', 'turns:' + TURN_HOST + ':443?transport=tcp'], username: user, credential: cred });
-    } catch (e) { /* no WebCrypto: STUN only */ }
+      relayInfo = 'relä: publik Open Relay (ingen egen TURN)';
+    } catch (e) { relayInfo = 'relä: ingen (bara STUN)'; }
     return list;
   }
-  const peerOpts = async () => Object.assign({ debug: 0, config: { iceServers: await iceServers() } }, store.get('livePeerServer', {}));
+  // ?relay forces every connection through TURN: a test that the relay works (as on eduroam).
+  const peerOpts = async () => Object.assign({ debug: 0, config: Object.assign({ iceServers: await iceServers() }, params.has('relay') ? { iceTransportPolicy: 'relay' } : {}) }, store.get('livePeerServer', {}));
   const bar = h('div', { class: 'live-bar ' + role, role: 'status' });
   document.body.appendChild(bar);
   document.body.classList.add('live-mode', 'live-' + role);
@@ -4115,7 +4141,7 @@ var LIVE = (() => {
     async function start() {
       status = 'ansluter…'; drawBar();
       peer = new Peer(PREFIX + code, await peerOpts());
-      peer.on('open', () => { status = 'redo'; drawBar(); });
+      peer.on('open', () => { status = 'redo · ' + relayInfo; drawBar(); });
       peer.on('connection', (conn) => {
         conn.on('open', () => { conns.set(conn.peer, conn); conn.send(snapshot()); soon(); });
         conn.on('data', (m) => onData(conn, m));
@@ -4169,7 +4195,7 @@ var LIVE = (() => {
     api.code = code;
     let voter = store.get('liveVoter', null);
     if (!voter) { voter = Math.random().toString(36).slice(2) + Date.now().toString(36); store.set('liveVoter', voter); }
-    let peer = null, conn = null, follow = true, live = null, status = 'ansluter…', amLost = false, helpOn = false, helpTxt = '';
+    let fails = 0, peer = null, conn = null, follow = true, live = null, status = 'ansluter…', amLost = false, helpOn = false, helpTxt = '';
     const send = (m) => { if (conn && conn.open) conn.send(Object.assign({ v: voter }, m)); };
     api.submit = (qid, p) => send({ t: 'ans', qid, p });
     api.connected = () => !!(conn && conn.open);
@@ -4223,18 +4249,26 @@ var LIVE = (() => {
     }
     function connect() {
       if (!peer || peer.destroyed) return;
-      status = 'ansluter…'; drawBar();
+      if (fails < 2) { status = 'ansluter…'; drawBar(); }
       conn = peer.connect(PREFIX + code, { reliable: true });
-      conn.on('open', () => { status = 'ansluten'; hello(); drawBar(); Object.values(CTL).forEach((c) => c.refresh()); });
+      const c0 = conn;
+      const guard = setTimeout(() => {       // the data channel never opened: blocked network
+        if (c0.open || conn !== c0 || c0.waiting) return;
+        fails += 1;
+        status = fails >= 2 ? 'når inte seminariet från det här nätet: prova mobildata eller stäng av VPN · försöker igen…' : 'ansluter fortfarande…';
+        c0.gaveUp = true; drawBar(); try { c0.close(); } catch (e) { /* ignore */ }
+        setTimeout(connect, 1000);
+      }, 15000);
+      conn.on('open', () => { clearTimeout(guard); fails = 0; status = 'ansluten'; hello(); drawBar(); Object.values(CTL).forEach((c) => c.refresh()); });
       conn.on('data', (m) => { if (m && m.t === 'state') onState(m); else if (m && m.t === 'helpAck' && m.v === voter && !m.on) { helpOn = false; drawBar(); } });
-      conn.on('close', () => { status = 'anslutningen bröts, försöker igen…'; drawBar(); setTimeout(connect, 3000); });
+      conn.on('close', () => { clearTimeout(guard); if (conn !== c0 || c0.gaveUp) return; status = 'anslutningen bröts, försöker igen…'; drawBar(); setTimeout(connect, 3000); });
       conn.on('error', () => { /* close follows */ });
     }
     async function start() {
       peer = new Peer(await peerOpts());
       peer.on('open', connect);
       peer.on('error', (e) => {
-        if (e.type === 'peer-unavailable') { status = 'seminariet ' + code + ' har inte startat än, försöker igen…'; drawBar(); setTimeout(connect, 4000); }
+        if (e.type === 'peer-unavailable') { if (conn) conn.waiting = true; status = 'seminariet ' + code + ' har inte startat än, försöker igen…'; drawBar(); setTimeout(connect, 4000); }
         else if (e.type === 'network' || e.type === 'server-error' || e.type === 'socket-error') { status = 'inget nätverk, försöker igen…'; drawBar(); setTimeout(() => { try { peer.reconnect(); } catch (x) { /* ignore */ } }, 4000); }
         else { status = 'fel: ' + e.type; drawBar(); }
       });
